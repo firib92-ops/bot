@@ -1,585 +1,846 @@
 import asyncio
-import json
 import logging
+import json
 import os
 import time
-import aiohttp
+from datetime import datetime, timedelta
+from collections import defaultdict
+
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.exceptions import TelegramBadRequest
+import aiohttp
+import aiosqlite
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
-
-BOT_TOKEN    = "8785816519:AAEZBsriAk182crzy7xZbXoJcE-ztCyeiqk"
-CHANNEL_ID   = -1002820751232          # исправлен: -100 + 2820751232
+# ── Config ──────────────────────────────────────────────────────────────────
+BOT_TOKEN = "8785816519:AAEZBsriAk182crzy7xZbXoJcE-ztCyeiqk"
+CHANNEL_ID = -1003820751232
 CHANNEL_LINK = "https://t.me/growagarden2track"
-API_URL      = "https://grow-a-garden-2-tracker.onrender.com/api/stock"
-DATA_FILE    = "users.json"
-CHECK_INTERVAL = 60          # секунд между проверками стока
-ADMIN_CODE   = "grehI07"     # код для входа в админ-панель
+STOCK_API = "https://grow-a-garden-2-tracker.onrender.com/api/stock"
+ADMIN_CODE = "GrehI07"
+DB_PATH = "garden_bot.db"
+POLL_INTERVAL = 60  # seconds
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
 
 bot = Bot(token=BOT_TOKEN)
-dp  = Dispatcher(storage=MemoryStorage())
+dp = Dispatcher(storage=MemoryStorage())
 
-# ── онлайн-трекер (последнее время активности) ───────────────────────────────
-online: dict[int, float] = {}   # user_id → unix timestamp последнего действия
-ONLINE_TTL = 300                 # считаем онлайн 5 минут после последнего действия
+# ── States ───────────────────────────────────────────────────────────────────
+class AdminStates(StatesGroup):
+    waiting_admin_code = State()
+    broadcast_text = State()
+    broadcast_scheduled = State()
+    search_user = State()
+    ban_user = State()
+    unban_user = State()
 
-def touch_online(uid: int):
-    online[uid] = time.time()
+# ── Database ─────────────────────────────────────────────────────────────────
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                full_name TEXT,
+                joined_at TEXT,
+                is_banned INTEGER DEFAULT 0,
+                last_active TEXT
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                user_id INTEGER,
+                seed_name TEXT,
+                PRIMARY KEY (user_id, seed_name)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS notification_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                seed_name TEXT,
+                sent_at TEXT
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS stock_cache (
+                key TEXT PRIMARY KEY,
+                data TEXT,
+                updated_at TEXT
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS admin_sessions (
+                user_id INTEGER PRIMARY KEY,
+                authed_at TEXT
+            )
+        """)
+        await db.commit()
 
-def is_online(uid: int) -> bool:
-    return time.time() - online.get(uid, 0) < ONLINE_TTL
+async def upsert_user(user: types.User):
+    now = datetime.now().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO users (user_id, username, full_name, joined_at, last_active)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username=excluded.username,
+                full_name=excluded.full_name,
+                last_active=excluded.last_active
+        """, (user.id, user.username, user.full_name, now, now))
+        await db.commit()
 
-# ── FSM states ────────────────────────────────────────────────────────────────
-class AdminState(StatesGroup):
-    waiting_code    = State()
-    in_panel        = State()
-    writing_user    = State()   # uid хранится в data["target_uid"]
+async def is_banned(user_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT is_banned FROM users WHERE user_id=?", (user_id,)) as cur:
+            row = await cur.fetchone()
+            return bool(row and row[0])
 
-# ── Data helpers ──────────────────────────────────────────────────────────────
-def load_data() -> dict:
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+async def is_admin(user_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT user_id FROM admin_sessions WHERE user_id=?", (user_id,)) as cur:
+            return bool(await cur.fetchone())
 
-def save_data(data: dict):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+async def set_admin(user_id: int):
+    now = datetime.now().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR REPLACE INTO admin_sessions VALUES (?,?)", (user_id, now))
+        await db.commit()
 
-def get_user(user_id: int) -> dict:
-    data = load_data()
-    uid  = str(user_id)
-    if uid not in data:
-        data[uid] = {"subscriptions": [], "notified": {}, "history": [], "name": ""}
-        save_data(data)
-    return data[uid]
+async def get_user_subs(user_id: int) -> list:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT seed_name FROM subscriptions WHERE user_id=?", (user_id,)) as cur:
+            rows = await cur.fetchall()
+            return [r[0] for r in rows]
 
-def update_user(user_id: int, user_data: dict):
-    data = load_data()
-    data[str(user_id)] = user_data
-    save_data(data)
+async def toggle_sub(user_id: int, seed_name: str) -> bool:
+    """Returns True if subscribed, False if unsubscribed"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT 1 FROM subscriptions WHERE user_id=? AND seed_name=?", (user_id, seed_name)) as cur:
+            exists = await cur.fetchone()
+        if exists:
+            await db.execute("DELETE FROM subscriptions WHERE user_id=? AND seed_name=?", (user_id, seed_name))
+            await db.commit()
+            return False
+        else:
+            await db.execute("INSERT INTO subscriptions VALUES (?,?)", (user_id, seed_name))
+            await db.commit()
+            return True
 
-def log_message(user_id: int, text: str):
-    """Сохраняем историю сообщений пользователя (последние 50)."""
-    data = load_data()
-    uid  = str(user_id)
-    if uid not in data:
-        data[uid] = {"subscriptions": [], "notified": {}, "history": [], "name": ""}
-    history = data[uid].setdefault("history", [])
-    history.append({"ts": int(time.time()), "text": text})
-    data[uid]["history"] = history[-50:]
-    save_data(data)
+async def get_all_users() -> list:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT user_id FROM users WHERE is_banned=0") as cur:
+            return [r[0] for r in await cur.fetchall()]
 
-# ── API ───────────────────────────────────────────────────────────────────────
-async def fetch_stock() -> dict | None:
+async def get_channel_subs_users() -> list:
+    """Users who are subscribed to channel (we track via check)"""
+    return await get_all_users()
+
+async def get_stats() -> dict:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM users") as c:
+            total = (await c.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM users WHERE is_banned=0") as c:
+            active = (await c.fetchone())[0]
+        async with db.execute("SELECT COUNT(DISTINCT user_id) FROM subscriptions") as c:
+            notif_users = (await c.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM subscriptions") as c:
+            total_subs = (await c.fetchone())[0]
+        today = datetime.now().date().isoformat()
+        async with db.execute("SELECT COUNT(*) FROM users WHERE joined_at LIKE ?", (f"{today}%",)) as c:
+            new_today = (await c.fetchone())[0]
+        async with db.execute("""
+            SELECT seed_name, COUNT(*) as cnt FROM subscriptions
+            GROUP BY seed_name ORDER BY cnt DESC LIMIT 10
+        """) as c:
+            top_seeds = await c.fetchall()
+        async with db.execute("""
+            SELECT strftime('%H', sent_at) as hr, COUNT(*) FROM notification_log
+            GROUP BY hr ORDER BY hr
+        """) as c:
+            hourly = await c.fetchall()
+        async with db.execute("""
+            SELECT date(joined_at) as d, COUNT(*) FROM users
+            WHERE joined_at >= date('now', '-7 days')
+            GROUP BY d ORDER BY d
+        """) as c:
+            daily_new = await c.fetchall()
+    return {
+        "total": total, "active": active, "banned": total - active,
+        "notif_users": notif_users, "total_subs": total_subs,
+        "new_today": new_today, "top_seeds": top_seeds,
+        "hourly": hourly, "daily_new": daily_new
+    }
+
+# ── Stock API ────────────────────────────────────────────────────────────────
+_last_stock = {}
+_last_stock_time = 0
+
+async def fetch_stock() -> dict:
+    global _last_stock, _last_stock_time
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(API_URL, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            async with session.get(STOCK_API, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 200:
-                    return await resp.json()
+                    data = await resp.json()
+                    _last_stock = data
+                    _last_stock_time = time.time()
+                    # cache to db
+                    async with aiosqlite.connect(DB_PATH) as db:
+                        await db.execute(
+                            "INSERT OR REPLACE INTO stock_cache VALUES ('main', ?, ?)",
+                            (json.dumps(data), datetime.now().isoformat())
+                        )
+                        await db.commit()
+                    return data
     except Exception as e:
-        logger.error(f"API error: {e}")
-    return None
+        log.warning(f"Stock fetch error: {e}")
+    return _last_stock
 
-def format_stock(stock: dict) -> str:
-    lines = ["🌱 <b>Grow a Garden 2 — текущий сток</b>\n"]
+def format_stock_message(stock: dict) -> str:
     if not stock:
-        return "⚠️ Не удалось получить данные стока."
-    for category, items in stock.items():
-        if not items:
-            continue
-        emoji = category_emoji(category)
-        lines.append(f"\n{emoji} <b>{category}</b>")
-        if isinstance(items, list):
-            for item in items:
-                lines.append(item_line(item))
-        elif isinstance(items, dict):
-            for name, info in items.items():
-                lines.append(item_line(info, name))
+        return "⚠️ Не удалось получить данные о стоке."
+
+    lines = ["🌱 <b>Grow a Garden 2 — Текущий сток</b>\n"]
+    lines.append(f"🕐 Обновлено: {datetime.now().strftime('%H:%M:%S %d.%m.%Y')}\n")
+
+    # Handle both flat and nested structures
+    if isinstance(stock, dict):
+        for category, items in stock.items():
+            if isinstance(items, dict):
+                lines.append(f"\n<b>📦 {category}</b>")
+                for name, info in items.items():
+                    if isinstance(info, dict):
+                        qty = info.get("quantity", info.get("stock", info.get("amount", "?")))
+                        price = info.get("price", info.get("cost", ""))
+                        price_str = f" | 💰 {price}" if price else ""
+                        lines.append(f"  • <b>{name}</b>: {qty}{price_str}")
+                    else:
+                        lines.append(f"  • <b>{name}</b>: {info}")
+            elif isinstance(items, list):
+                lines.append(f"\n<b>📦 {category}</b>")
+                for item in items:
+                    if isinstance(item, dict):
+                        name = item.get("name", item.get("id", "Unknown"))
+                        qty = item.get("quantity", item.get("stock", item.get("amount", "?")))
+                        price = item.get("price", item.get("cost", ""))
+                        price_str = f" | 💰 {price}" if price else ""
+                        lines.append(f"  • <b>{name}</b>: {qty}{price_str}")
+                    else:
+                        lines.append(f"  • {item}")
+            else:
+                lines.append(f"\n• <b>{category}</b>: {items}")
+
     return "\n".join(lines)
 
-def category_emoji(cat: str) -> str:
-    c = cat.lower()
-    if "seed"  in c: return "🌰"
-    if "gear"  in c: return "⚙️"
-    if "egg"   in c: return "🥚"
-    if "pet"   in c: return "🐾"
-    if "crop"  in c: return "🌾"
-    if "fruit" in c: return "🍓"
-    if "tool"  in c: return "🔧"
-    if "shop"  in c: return "🛒"
-    return "📦"
-
-def item_line(item, fallback_name: str = "") -> str:
-    if isinstance(item, dict):
-        name  = item.get("name") or item.get("item") or fallback_name
-        qty   = item.get("quantity") or item.get("stock") or item.get("amount") or ""
-        price = item.get("price") or item.get("cost") or ""
-        parts = [f"  • {name}"]
-        if qty:   parts.append(f"x{qty}")
-        if price: parts.append(f"💰{price}")
-        return " ".join(parts)
-    return f"  • {item}"
-
-def extract_all_items(stock: dict) -> list[str]:
-    items = set()
-    for category, contents in stock.items():
-        if isinstance(contents, list):
-            for item in contents:
+def extract_seeds(stock: dict) -> list:
+    """Extract all seed names from stock"""
+    seeds = []
+    if not stock:
+        return seeds
+    for category, items in stock.items():
+        cat_lower = category.lower()
+        if "seed" in cat_lower or "plant" in cat_lower or "crop" in cat_lower:
+            if isinstance(items, dict):
+                seeds.extend(items.keys())
+            elif isinstance(items, list):
+                for item in items:
+                    if isinstance(item, dict):
+                        name = item.get("name", item.get("id", ""))
+                        if name:
+                            seeds.append(name)
+        elif isinstance(items, dict):
+            for name in items.keys():
+                if "seed" in name.lower() or "plant" in name.lower():
+                    seeds.append(name)
+        elif isinstance(items, list):
+            for item in items:
                 if isinstance(item, dict):
-                    name = item.get("name") or item.get("item") or ""
-                    if name: items.add(name)
-                elif isinstance(item, str):
-                    items.add(item)
-        elif isinstance(contents, dict):
-            for name in contents.keys():
-                items.add(name)
-    return sorted(items)
+                    name = item.get("name", item.get("id", ""))
+                    if name and ("seed" in name.lower() or "plant" in name.lower()):
+                        seeds.append(name)
+    # fallback - return all items
+    if not seeds:
+        for category, items in stock.items():
+            if isinstance(items, dict):
+                seeds.extend(items.keys())
+            elif isinstance(items, list):
+                for item in items:
+                    if isinstance(item, dict):
+                        name = item.get("name", item.get("id", ""))
+                        if name:
+                            seeds.append(name)
+    return list(set(seeds))
 
-# ── Subscription ──────────────────────────────────────────────────────────────
-async def is_subscribed(user_id: int) -> bool:
-    """
-    Проверяем подписку через get_chat_member.
-    Если бот НЕ администратор канала — всегда возвращает False.
-    Убедись, что бот добавлен как администратор в канал!
-    """
+def is_in_stock(stock: dict, seed_name: str) -> bool:
+    for category, items in stock.items():
+        if isinstance(items, dict):
+            if seed_name in items:
+                info = items[seed_name]
+                if isinstance(info, dict):
+                    qty = info.get("quantity", info.get("stock", info.get("amount", 0)))
+                    try:
+                        return int(qty) > 0
+                    except:
+                        return bool(qty)
+                return bool(info)
+        elif isinstance(items, list):
+            for item in items:
+                if isinstance(item, dict):
+                    name = item.get("name", item.get("id", ""))
+                    if name == seed_name:
+                        qty = item.get("quantity", item.get("stock", item.get("amount", 0)))
+                        try:
+                            return int(qty) > 0
+                        except:
+                            return bool(qty)
+    return False
+
+# ── Channel check ─────────────────────────────────────────────────────────────
+async def check_channel_sub(user_id: int) -> bool:
     try:
         member = await bot.get_chat_member(CHANNEL_ID, user_id)
-        status = member.status
-        logger.info(f"User {user_id} channel status: {status}")
-        return status not in ("left", "kicked", "banned", "restricted")
-    except Exception as e:
-        logger.warning(f"Subscription check error for {user_id}: {e}")
-        # Если не можем проверить — пропускаем (чтобы не блокировать всех)
-        return True
+        return member.status not in ("left", "kicked")
+    except Exception:
+        return False
 
-def subscription_keyboard() -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.button(text="📢 Подписаться на канал", url=CHANNEL_LINK)
-    builder.button(text="✅ Я подписался", callback_data="check_sub")
-    builder.adjust(1)
-    return builder.as_markup()
+def sub_required_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📢 Подписаться на канал", url=CHANNEL_LINK),
+        InlineKeyboardButton(text="✅ Я подписался", callback_data="check_sub")
+    ]])
 
-# ── Keyboards ─────────────────────────────────────────────────────────────────
-def main_menu() -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.button(text="📦 Посмотреть сток",       callback_data="view_stock")
-    builder.button(text="🔔 Настроить уведомления", callback_data="manage_alerts")
-    builder.button(text="📋 Мои подписки",           callback_data="my_subs")
-    builder.adjust(1)
-    return builder.as_markup()
+# ── Main menu ─────────────────────────────────────────────────────────────────
+def main_menu_kb():
+    return ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="📦 Смотреть сток"), KeyboardButton(text="🔔 Настройки уведомлений")],
+        [KeyboardButton(text="ℹ️ О боте")]
+    ], resize_keyboard=True)
 
-def alerts_menu(user_id: int, stock_items: list[str]) -> InlineKeyboardMarkup:
-    user = get_user(user_id)
-    subs = set(user.get("subscriptions", []))
-    builder = InlineKeyboardBuilder()
-    for item in stock_items:
-        tick = "✅" if item in subs else "☑️"
-        builder.button(text=f"{tick} {item}", callback_data=f"toggle_{item}")
-    builder.button(text="🔙 Назад", callback_data="back_menu")
-    builder.adjust(2)
-    return builder.as_markup()
-
-# ── Admin keyboards ───────────────────────────────────────────────────────────
-def admin_main_kb() -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    b.button(text="👥 Онлайн / Пользователи", callback_data="adm_users")
-    b.button(text="📊 Статистика",             callback_data="adm_stats")
-    b.button(text="🚪 Выйти",                  callback_data="adm_exit")
-    b.adjust(1)
-    return b.as_markup()
-
-def admin_users_kb(page: int = 0) -> InlineKeyboardMarkup:
-    data  = load_data()
-    uids  = list(data.keys())
-    PER   = 10
-    chunk = uids[page*PER:(page+1)*PER]
-    b     = InlineKeyboardBuilder()
-    for uid in chunk:
-        u    = data[uid]
-        name = u.get("name") or uid
-        dot  = "🟢" if is_online(int(uid)) else "⚫"
-        b.button(text=f"{dot} {name} ({uid})", callback_data=f"adm_user_{uid}")
-    # пагинация
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"adm_page_{page-1}"))
-    if (page+1)*PER < len(uids):
-        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"adm_page_{page+1}"))
-    if nav:
-        b.row(*nav)
-    b.button(text="🔙 Назад", callback_data="adm_back")
-    b.adjust(1)
-    return b.as_markup()
-
-def admin_user_kb(uid: str) -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    b.button(text="🔔 Уведомления",     callback_data=f"adm_subs_{uid}")
-    b.button(text="📜 История сообщ.",  callback_data=f"adm_hist_{uid}")
-    b.button(text="✉️ Написать",        callback_data=f"adm_write_{uid}")
-    b.button(text="🔙 Назад",           callback_data="adm_users")
-    b.adjust(1)
-    return b.as_markup()
-
-# ── User handlers ─────────────────────────────────────────────────────────────
+# ── Handlers ──────────────────────────────────────────────────────────────────
 @dp.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext):
-    touch_online(message.from_user.id)
-    user = get_user(message.from_user.id)
-    name = message.from_user.full_name or ""
-    if user.get("name") != name:
-        user["name"] = name
-        update_user(message.from_user.id, user)
-    log_message(message.from_user.id, "/start")
+async def cmd_start(msg: types.Message):
+    await upsert_user(msg.from_user)
+    if await is_banned(msg.from_user.id):
+        await msg.answer("🚫 Вы заблокированы.")
+        return
 
     text = (
-        "👋 Привет! Я <b>Grow a Garden 2 Stock Bot</b>.\n\n"
-        "Я слежу за стоком предметов в игре и пришлю уведомление, "
-        "когда нужный тебе предмет появится в продаже.\n\n"
-        "Для использования бота нужно подписаться на канал 👇"
+        "🌱 <b>Добро пожаловать в Grow a Garden 2 Stock Bot!</b>\n\n"
+        "Здесь ты можешь:\n"
+        "📦 Смотреть текущий сток всех предметов\n"
+        "🔔 Настраивать уведомления на конкретные seeds\n\n"
+        "Для доступа к стоку нужно подписаться на наш канал 👇"
     )
-    if await is_subscribed(message.from_user.id):
-        await message.answer(
-            text + "\n\n✅ Ты уже подписан! Выбери действие:",
-            reply_markup=main_menu(), parse_mode="HTML"
+    await msg.answer(text, parse_mode="HTML", reply_markup=sub_required_keyboard())
+
+@dp.callback_query(F.data == "check_sub")
+async def check_sub_cb(call: types.CallbackQuery):
+    await upsert_user(call.from_user)
+    if await is_banned(call.from_user.id):
+        await call.answer("🚫 Вы заблокированы.", show_alert=True)
+        return
+    if await check_channel_sub(call.from_user.id):
+        await call.message.edit_text(
+            "✅ <b>Подписка подтверждена!</b>\n\nТеперь ты можешь пользоваться всеми функциями бота 🎉",
+            parse_mode="HTML"
         )
+        await call.message.answer("Выбери действие:", reply_markup=main_menu_kb())
     else:
-        await message.answer(text, reply_markup=subscription_keyboard(), parse_mode="HTML")
+        await call.answer("❌ Вы ещё не подписались на канал!", show_alert=True)
 
+async def require_sub(msg: types.Message) -> bool:
+    if not await check_channel_sub(msg.from_user.id):
+        await msg.answer(
+            "❗ Для использования бота нужно подписаться на канал:",
+            reply_markup=sub_required_keyboard()
+        )
+        return False
+    return True
+
+@dp.message(F.text == "📦 Смотреть сток")
+async def show_stock(msg: types.Message):
+    await upsert_user(msg.from_user)
+    if await is_banned(msg.from_user.id): return
+    if not await require_sub(msg): return
+
+    wait = await msg.answer("⏳ Загружаю сток...")
+    stock = await fetch_stock()
+    text = format_stock_message(stock)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🔄 Обновить", callback_data="refresh_stock")
+    ]])
+    try:
+        await wait.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    except TelegramBadRequest:
+        await wait.delete()
+        await msg.answer(text, parse_mode="HTML", reply_markup=kb)
+
+@dp.callback_query(F.data == "refresh_stock")
+async def refresh_stock_cb(call: types.CallbackQuery):
+    if await is_banned(call.from_user.id): return
+    if not await check_channel_sub(call.from_user.id):
+        await call.answer("❗ Подпишитесь на канал!", show_alert=True)
+        return
+    stock = await fetch_stock()
+    text = format_stock_message(stock)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🔄 Обновить", callback_data="refresh_stock")
+    ]])
+    try:
+        await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+        await call.answer("✅ Обновлено!")
+    except TelegramBadRequest:
+        await call.answer("Уже актуально!")
+
+# ── Notification settings ────────────────────────────────────────────────────
+@dp.message(F.text == "🔔 Настройки уведомлений")
+async def notif_settings(msg: types.Message):
+    await upsert_user(msg.from_user)
+    if await is_banned(msg.from_user.id): return
+    if not await require_sub(msg): return
+
+    stock = await fetch_stock()
+    seeds = extract_seeds(stock)
+    user_subs = await get_user_subs(msg.from_user.id)
+
+    if not seeds:
+        await msg.answer("⚠️ Не удалось загрузить список seeds. Попробуйте позже.")
+        return
+
+    text = "🔔 <b>Настройки уведомлений</b>\n\nВыбери seeds, о появлении которых хочешь получать уведомления:\n✅ — уведомления включены  |  ⬜ — выключены"
+    kb = build_seeds_keyboard(seeds, user_subs)
+    await msg.answer(text, parse_mode="HTML", reply_markup=kb)
+
+def build_seeds_keyboard(seeds: list, user_subs: list) -> InlineKeyboardMarkup:
+    buttons = []
+    for seed in sorted(seeds):
+        icon = "✅" if seed in user_subs else "⬜"
+        buttons.append([InlineKeyboardButton(text=f"{icon} {seed}", callback_data=f"toggle_seed:{seed}")])
+    buttons.append([InlineKeyboardButton(text="❌ Отключить все", callback_data="unsub_all")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+@dp.callback_query(F.data.startswith("toggle_seed:"))
+async def toggle_seed_cb(call: types.CallbackQuery):
+    seed = call.data.split(":", 1)[1]
+    if await is_banned(call.from_user.id): return
+
+    subscribed = await toggle_sub(call.from_user.id, seed)
+    action = "включены ✅" if subscribed else "отключены ⬜"
+    await call.answer(f"Уведомления для «{seed}» {action}")
+
+    # rebuild keyboard
+    stock = await fetch_stock()
+    seeds = extract_seeds(stock)
+    user_subs = await get_user_subs(call.from_user.id)
+    kb = build_seeds_keyboard(seeds, user_subs)
+    try:
+        await call.message.edit_reply_markup(reply_markup=kb)
+    except TelegramBadRequest:
+        pass
+
+@dp.callback_query(F.data == "unsub_all")
+async def unsub_all_cb(call: types.CallbackQuery):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM subscriptions WHERE user_id=?", (call.from_user.id,))
+        await db.commit()
+    await call.answer("❌ Все уведомления отключены")
+    stock = await fetch_stock()
+    seeds = extract_seeds(stock)
+    kb = build_seeds_keyboard(seeds, [])
+    try:
+        await call.message.edit_reply_markup(reply_markup=kb)
+    except TelegramBadRequest:
+        pass
+
+@dp.message(F.text == "ℹ️ О боте")
+async def about_bot(msg: types.Message):
+    text = (
+        "🌱 <b>Grow a Garden 2 Stock Bot</b>\n\n"
+        "Бот отслеживает текущий сток игры в реальном времени и отправляет уведомления, "
+        "когда выбранные тобой seeds появляются в продаже.\n\n"
+        "🔄 Данные обновляются каждую минуту\n"
+        "📢 Канал: @growagarden2track\n\n"
+        "<i>Нажми /start чтобы начать</i>"
+    )
+    await msg.answer(text, parse_mode="HTML")
+
+# ── Admin ─────────────────────────────────────────────────────────────────────
 @dp.message(Command("admin"))
-async def cmd_admin(message: Message, state: FSMContext):
-    touch_online(message.from_user.id)
-    await state.set_state(AdminState.waiting_code)
-    await message.answer("🔐 Введи код доступа к админ-панели:")
+async def admin_cmd(msg: types.Message, state: FSMContext):
+    if await is_admin(msg.from_user.id):
+        await show_admin_panel(msg)
+        return
+    await msg.answer("🔐 Введите код администратора:")
+    await state.set_state(AdminStates.waiting_admin_code)
 
-@dp.message(AdminState.waiting_code)
-async def admin_code_input(message: Message, state: FSMContext):
-    if message.text == ADMIN_CODE:
-        await state.set_state(AdminState.in_panel)
-        await message.answer("✅ Добро пожаловать в админ-панель!", reply_markup=admin_main_kb())
+@dp.message(AdminStates.waiting_admin_code)
+async def admin_code_input(msg: types.Message, state: FSMContext):
+    if msg.text.strip() == ADMIN_CODE:
+        await set_admin(msg.from_user.id)
+        await state.clear()
+        await msg.answer("✅ Доступ к панели администратора открыт!")
+        await show_admin_panel(msg)
     else:
         await state.clear()
-        await message.answer("❌ Неверный код.")
+        await msg.answer("❌ Неверный код.")
 
-# Все текстовые сообщения пользователей — логируем
-@dp.message(F.text)
-async def any_text(message: Message, state: FSMContext):
-    touch_online(message.from_user.id)
-    current = await state.get_state()
-
-    # Если ждём сообщение от админа пользователю
-    if current == AdminState.writing_user.state:
-        data_state = await state.get_data()
-        target = data_state.get("target_uid")
-        if target:
-            try:
-                await bot.send_message(
-                    int(target),
-                    f"📩 <b>Сообщение от администратора:</b>\n\n{message.text}",
-                    parse_mode="HTML"
-                )
-                await message.answer("✅ Сообщение отправлено!", reply_markup=admin_main_kb())
-            except Exception as e:
-                await message.answer(f"❌ Ошибка: {e}", reply_markup=admin_main_kb())
-        await state.set_state(AdminState.in_panel)
-        return
-
-    # Обычный пользователь — логируем
-    if current not in (AdminState.waiting_code.state, AdminState.in_panel.state):
-        log_message(message.from_user.id, message.text or "")
-
-# ── Callback: проверка подписки ───────────────────────────────────────────────
-@dp.callback_query(F.data == "check_sub")
-async def check_sub(call: CallbackQuery):
-    touch_online(call.from_user.id)
-    if await is_subscribed(call.from_user.id):
-        await call.message.edit_text(
-            "✅ Подписка подтверждена! Добро пожаловать 🎉\n\nВыбери действие:",
-            reply_markup=main_menu()
-        )
-    else:
-        await call.answer(
-            "❌ Подписка не найдена.\n\nУбедись, что ты подписался на канал и попробуй снова.",
-            show_alert=True
-        )
-
-async def require_sub(call: CallbackQuery) -> bool:
-    if not await is_subscribed(call.from_user.id):
-        await call.message.edit_text(
-            "⚠️ Для использования бота нужно подписаться на канал:",
-            reply_markup=subscription_keyboard()
-        )
-        return False
-    return True
-
-# ── Callback: сток ────────────────────────────────────────────────────────────
-@dp.callback_query(F.data == "view_stock")
-async def view_stock(call: CallbackQuery):
-    touch_online(call.from_user.id)
-    if not await require_sub(call): return
-    await call.answer()
-    msg   = await call.message.edit_text("⏳ Загружаю сток...")
-    stock = await fetch_stock()
-    text  = format_stock(stock) if stock else "⚠️ Не удалось получить данные. Попробуй позже."
-    b = InlineKeyboardBuilder()
-    b.button(text="🔄 Обновить", callback_data="view_stock")
-    b.button(text="🔙 Назад",    callback_data="back_menu")
-    b.adjust(2)
-    await msg.edit_text(text, reply_markup=b.as_markup(), parse_mode="HTML")
-
-@dp.callback_query(F.data == "manage_alerts")
-async def manage_alerts(call: CallbackQuery):
-    touch_online(call.from_user.id)
-    if not await require_sub(call): return
-    await call.answer()
-    stock = await fetch_stock()
-    if not stock:
-        await call.message.edit_text("⚠️ Не удалось загрузить список предметов. Попробуй позже.")
-        return
-    items = extract_all_items(stock)
-    if not items:
-        await call.message.edit_text("⚠️ Список предметов пуст — сток сейчас пустой.")
-        return
-    await call.message.edit_text(
-        "🔔 <b>Настройка уведомлений</b>\n\nВыбери предметы — получишь уведомление, когда они появятся в стоке:",
-        reply_markup=alerts_menu(call.from_user.id, items),
-        parse_mode="HTML"
-    )
-
-@dp.callback_query(F.data.startswith("toggle_"))
-async def toggle_alert(call: CallbackQuery):
-    touch_online(call.from_user.id)
-    if not await require_sub(call): return
-    item_name = call.data[len("toggle_"):]
-    user = get_user(call.from_user.id)
-    subs = set(user.get("subscriptions", []))
-    if item_name in subs:
-        subs.discard(item_name)
-        await call.answer(f"🔕 Уведомления для «{item_name}» отключены")
-    else:
-        subs.add(item_name)
-        await call.answer(f"🔔 Уведомления для «{item_name}» включены")
-    user["subscriptions"] = list(subs)
-    update_user(call.from_user.id, user)
-    stock = await fetch_stock()
-    if stock:
-        await call.message.edit_reply_markup(reply_markup=alerts_menu(call.from_user.id, extract_all_items(stock)))
-
-@dp.callback_query(F.data == "my_subs")
-async def my_subs(call: CallbackQuery):
-    touch_online(call.from_user.id)
-    if not await require_sub(call): return
-    await call.answer()
-    user = get_user(call.from_user.id)
-    subs = user.get("subscriptions", [])
+async def show_admin_panel(msg: types.Message):
+    stats = await get_stats()
     text = (
-        "🔔 <b>Твои подписки на уведомления:</b>\n\n" + "\n".join(f"  • {s}" for s in sorted(subs))
-        if subs else
-        "У тебя нет активных подписок.\nНажми «Настроить уведомления», чтобы выбрать предметы."
+        f"🛠 <b>Панель администратора</b>\n\n"
+        f"👥 Всего пользователей: <b>{stats['total']}</b>\n"
+        f"✅ Активных: <b>{stats['active']}</b>\n"
+        f"🚫 Забанено: <b>{stats['banned']}</b>\n"
+        f"🔔 Используют уведомления: <b>{stats['notif_users']}</b>\n"
+        f"📌 Всего подписок на seeds: <b>{stats['total_subs']}</b>\n"
+        f"🆕 Новых сегодня: <b>{stats['new_today']}</b>"
     )
-    b = InlineKeyboardBuilder()
-    b.button(text="🔔 Настроить уведомления", callback_data="manage_alerts")
-    b.button(text="🔙 Назад", callback_data="back_menu")
-    b.adjust(1)
-    await call.message.edit_text(text, reply_markup=b.as_markup(), parse_mode="HTML")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin:broadcast_menu")],
+        [InlineKeyboardButton(text="👤 Пользователи", callback_data="admin:users_menu")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats_menu")],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin:refresh")]
+    ])
+    await msg.answer(text, parse_mode="HTML", reply_markup=kb)
 
-@dp.callback_query(F.data == "back_menu")
-async def back_menu(call: CallbackQuery):
-    touch_online(call.from_user.id)
-    await call.answer()
-    await call.message.edit_text(
-        "🌱 <b>Grow a Garden 2 Stock Bot</b>\n\nВыбери действие:",
-        reply_markup=main_menu(), parse_mode="HTML"
+@dp.callback_query(F.data == "admin:refresh")
+async def admin_refresh(call: types.CallbackQuery):
+    if not await is_admin(call.from_user.id):
+        await call.answer("❌ Нет доступа", show_alert=True); return
+    stats = await get_stats()
+    text = (
+        f"🛠 <b>Панель администратора</b>\n\n"
+        f"👥 Всего пользователей: <b>{stats['total']}</b>\n"
+        f"✅ Активных: <b>{stats['active']}</b>\n"
+        f"🚫 Забанено: <b>{stats['banned']}</b>\n"
+        f"🔔 Используют уведомления: <b>{stats['notif_users']}</b>\n"
+        f"📌 Всего подписок на seeds: <b>{stats['total_subs']}</b>\n"
+        f"🆕 Новых сегодня: <b>{stats['new_today']}</b>"
     )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin:broadcast_menu")],
+        [InlineKeyboardButton(text="👤 Пользователи", callback_data="admin:users_menu")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats_menu")],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin:refresh")]
+    ])
+    try:
+        await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    except TelegramBadRequest:
+        pass
+    await call.answer("✅")
 
-# ── Admin callbacks ───────────────────────────────────────────────────────────
-async def admin_guard(call: CallbackQuery, state: FSMContext) -> bool:
-    current = await state.get_state()
-    if current not in (AdminState.in_panel.state, AdminState.writing_user.state):
-        await call.answer("❌ Нет доступа. Введи /admin", show_alert=True)
-        return False
-    return True
+# Broadcast menu
+@dp.callback_query(F.data == "admin:broadcast_menu")
+async def broadcast_menu(call: types.CallbackQuery):
+    if not await is_admin(call.from_user.id):
+        await call.answer("❌ Нет доступа", show_alert=True); return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📣 Отправить всем", callback_data="admin:broadcast:all")],
+        [InlineKeyboardButton(text="📢 Отправить подписчикам канала", callback_data="admin:broadcast:channel")],
+        [InlineKeyboardButton(text="🧪 Тестовое сообщение", callback_data="admin:broadcast:test")],
+        [InlineKeyboardButton(text="⏰ Запланировать рассылку", callback_data="admin:broadcast:schedule")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="admin:back")]
+    ])
+    await call.message.edit_text("📢 <b>Рассылка</b>\n\nВыберите тип рассылки:", parse_mode="HTML", reply_markup=kb)
 
-@dp.callback_query(F.data == "adm_back")
-async def adm_back(call: CallbackQuery, state: FSMContext):
-    if not await admin_guard(call, state): return
-    await call.answer()
-    await call.message.edit_text("🛠 <b>Админ-панель</b>", reply_markup=admin_main_kb(), parse_mode="HTML")
+@dp.callback_query(F.data.startswith("admin:broadcast:"))
+async def broadcast_type(call: types.CallbackQuery, state: FSMContext):
+    if not await is_admin(call.from_user.id):
+        await call.answer("❌ Нет доступа", show_alert=True); return
+    btype = call.data.split(":")[-1]
+    await state.update_data(btype=btype)
 
-@dp.callback_query(F.data == "adm_exit")
-async def adm_exit(call: CallbackQuery, state: FSMContext):
+    if btype == "schedule":
+        await call.message.edit_text(
+            "⏰ Введите текст рассылки и время в формате:\n<code>ДД.ММ ЧЧЧЧ:ММ\nТекст сообщения</code>",
+            parse_mode="HTML"
+        )
+        await state.set_state(AdminStates.broadcast_scheduled)
+    else:
+        await call.message.edit_text("✏️ Введите текст сообщения для рассылки:")
+        await state.set_state(AdminStates.broadcast_text)
+
+@dp.message(AdminStates.broadcast_text)
+async def do_broadcast(msg: types.Message, state: FSMContext):
+    data = await state.get_data()
+    btype = data.get("btype", "all")
     await state.clear()
-    await call.answer()
-    await call.message.edit_text("🚪 Вышел из админ-панели.")
 
-@dp.callback_query(F.data == "adm_stats")
-async def adm_stats(call: CallbackQuery, state: FSMContext):
-    if not await admin_guard(call, state): return
-    await call.answer()
-    data     = load_data()
-    total    = len(data)
-    now_on   = sum(1 for uid in data if is_online(int(uid)))
-    with_sub = sum(1 for u in data.values() if u.get("subscriptions"))
-    text = (
-        f"📊 <b>Статистика бота</b>\n\n"
-        f"👥 Всего пользователей: <b>{total}</b>\n"
-        f"🟢 Сейчас онлайн: <b>{now_on}</b>\n"
-        f"🔔 Настроили уведомления: <b>{with_sub}</b>"
-    )
-    b = InlineKeyboardBuilder()
-    b.button(text="🔙 Назад", callback_data="adm_back")
-    await call.message.edit_text(text, reply_markup=b.as_markup(), parse_mode="HTML")
+    users = await get_all_users()
+    sent = 0
+    failed = 0
+    label = {"all": "всем", "channel": "подписчикам канала", "test": "тест"}.get(btype, "всем")
 
-@dp.callback_query(F.data == "adm_users")
-async def adm_users(call: CallbackQuery, state: FSMContext):
-    if not await admin_guard(call, state): return
-    await call.answer()
-    data   = load_data()
-    now_on = sum(1 for uid in data if is_online(int(uid)))
-    await call.message.edit_text(
-        f"👥 <b>Пользователи</b>\n🟢 Онлайн: {now_on} / {len(data)}\n\nВыбери пользователя:",
-        reply_markup=admin_users_kb(0), parse_mode="HTML"
-    )
+    status_msg = await msg.answer(f"📤 Начинаю рассылку ({label})...")
 
-@dp.callback_query(F.data.startswith("adm_page_"))
-async def adm_page(call: CallbackQuery, state: FSMContext):
-    if not await admin_guard(call, state): return
-    await call.answer()
-    page = int(call.data.split("_")[-1])
-    data = load_data()
-    now_on = sum(1 for uid in data if is_online(int(uid)))
-    await call.message.edit_text(
-        f"👥 <b>Пользователи</b>\n🟢 Онлайн: {now_on} / {len(data)}\n\nВыбери пользователя:",
-        reply_markup=admin_users_kb(page), parse_mode="HTML"
-    )
-
-@dp.callback_query(F.data.startswith("adm_user_"))
-async def adm_user(call: CallbackQuery, state: FSMContext):
-    if not await admin_guard(call, state): return
-    await call.answer()
-    uid  = call.data[len("adm_user_"):]
-    data = load_data()
-    u    = data.get(uid, {})
-    name = u.get("name") or "—"
-    dot  = "🟢 онлайн" if is_online(int(uid)) else "⚫ офлайн"
-    subs = len(u.get("subscriptions", []))
-    hist = len(u.get("history", []))
-    text = (
-        f"👤 <b>Пользователь</b>\n\n"
-        f"ID: <code>{uid}</code>\n"
-        f"Имя: {name}\n"
-        f"Статус: {dot}\n"
-        f"Уведомлений: {subs}\n"
-        f"Сообщений в истории: {hist}"
-    )
-    await call.message.edit_text(text, reply_markup=admin_user_kb(uid), parse_mode="HTML")
-
-@dp.callback_query(F.data.startswith("adm_subs_"))
-async def adm_subs(call: CallbackQuery, state: FSMContext):
-    if not await admin_guard(call, state): return
-    await call.answer()
-    uid  = call.data[len("adm_subs_"):]
-    data = load_data()
-    subs = data.get(uid, {}).get("subscriptions", [])
-    text = (
-        f"🔔 <b>Уведомления пользователя {uid}:</b>\n\n" +
-        ("\n".join(f"  • {s}" for s in sorted(subs)) if subs else "— нет активных подписок —")
-    )
-    b = InlineKeyboardBuilder()
-    b.button(text="🔙 Назад", callback_data=f"adm_user_{uid}")
-    await call.message.edit_text(text, reply_markup=b.as_markup(), parse_mode="HTML")
-
-@dp.callback_query(F.data.startswith("adm_hist_"))
-async def adm_hist(call: CallbackQuery, state: FSMContext):
-    if not await admin_guard(call, state): return
-    await call.answer()
-    uid  = call.data[len("adm_hist_"):]
-    data = load_data()
-    hist = data.get(uid, {}).get("history", [])
-    if hist:
-        lines = []
-        for h in hist[-20:]:
-            ts   = h.get("ts", 0)
-            from datetime import datetime
-            dt   = datetime.fromtimestamp(ts).strftime("%d.%m %H:%M")
-            lines.append(f"[{dt}] {h.get('text','')}")
-        body = "\n".join(lines)
+    if btype == "test":
+        try:
+            await bot.send_message(msg.from_user.id, f"🧪 <b>Тест рассылки:</b>\n\n{msg.text}", parse_mode="HTML")
+            sent = 1
+        except: failed = 1
     else:
-        body = "— история пуста —"
-    text = f"📜 <b>История сообщений {uid}:</b>\n\n<code>{body}</code>"
-    b = InlineKeyboardBuilder()
-    b.button(text="🔙 Назад", callback_data=f"adm_user_{uid}")
-    await call.message.edit_text(text[:4000], reply_markup=b.as_markup(), parse_mode="HTML")
+        for uid in users:
+            if btype == "channel" and not await check_channel_sub(uid):
+                continue
+            try:
+                await bot.send_message(uid, msg.text, parse_mode="HTML")
+                sent += 1
+                await asyncio.sleep(0.05)
+            except:
+                failed += 1
 
-@dp.callback_query(F.data.startswith("adm_write_"))
-async def adm_write(call: CallbackQuery, state: FSMContext):
-    if not await admin_guard(call, state): return
-    await call.answer()
-    uid = call.data[len("adm_write_"):]
-    await state.set_state(AdminState.writing_user)
-    await state.update_data(target_uid=uid)
-    await call.message.edit_text(
-        f"✉️ Введи сообщение для пользователя <code>{uid}</code>\n\n(оно придёт от лица бота)",
-        parse_mode="HTML"
+    await status_msg.edit_text(f"✅ Рассылка завершена!\n✉️ Отправлено: {sent}\n❌ Ошибок: {failed}")
+
+@dp.message(AdminStates.broadcast_scheduled)
+async def schedule_broadcast(msg: types.Message, state: FSMContext):
+    await state.clear()
+    try:
+        lines = msg.text.strip().split("\n", 1)
+        dt_str = lines[0].strip()
+        text = lines[1].strip() if len(lines) > 1 else "Тест"
+        dt = datetime.strptime(f"{datetime.now().year} {dt_str}", "%Y %d.%m %H:%M")
+        delay = (dt - datetime.now()).total_seconds()
+        if delay < 0:
+            await msg.answer("❌ Время уже прошло!")
+            return
+        await msg.answer(f"✅ Рассылка запланирована на {dt.strftime('%d.%m %H:%M')}")
+        asyncio.create_task(delayed_broadcast(delay, text, await get_all_users()))
+    except Exception as e:
+        await msg.answer(f"❌ Ошибка формата: {e}")
+
+async def delayed_broadcast(delay: float, text: str, users: list):
+    await asyncio.sleep(delay)
+    for uid in users:
+        try:
+            await bot.send_message(uid, text, parse_mode="HTML")
+            await asyncio.sleep(0.05)
+        except: pass
+
+# Users menu
+@dp.callback_query(F.data == "admin:users_menu")
+async def users_menu(call: types.CallbackQuery):
+    if not await is_admin(call.from_user.id):
+        await call.answer("❌ Нет доступа", show_alert=True); return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 Поиск по ID", callback_data="admin:search_user")],
+        [InlineKeyboardButton(text="🚫 Забанить", callback_data="admin:ban_user")],
+        [InlineKeyboardButton(text="✅ Разбанить", callback_data="admin:unban_user")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="admin:back")]
+    ])
+    await call.message.edit_text("👤 <b>Управление пользователями</b>", parse_mode="HTML", reply_markup=kb)
+
+@dp.callback_query(F.data == "admin:search_user")
+async def search_user(call: types.CallbackQuery, state: FSMContext):
+    if not await is_admin(call.from_user.id): return
+    await call.message.edit_text("🔍 Введите ID пользователя:")
+    await state.set_state(AdminStates.search_user)
+
+@dp.message(AdminStates.search_user)
+async def do_search_user(msg: types.Message, state: FSMContext):
+    await state.clear()
+    try:
+        uid = int(msg.text.strip())
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT * FROM users WHERE user_id=?", (uid,)) as cur:
+                row = await cur.fetchone()
+            async with db.execute("SELECT seed_name FROM subscriptions WHERE user_id=?", (uid,)) as cur:
+                subs = [r[0] for r in await cur.fetchall()]
+        if row:
+            banned = "🚫 Да" if row[4] else "✅ Нет"
+            text = (
+                f"👤 <b>Пользователь {uid}</b>\n"
+                f"Имя: {row[2]}\n"
+                f"Username: @{row[1] or '—'}\n"
+                f"Зарегистрирован: {row[3][:10]}\n"
+                f"Заблокирован: {banned}\n"
+                f"Подписки: {', '.join(subs) if subs else 'нет'}"
+            )
+        else:
+            text = f"❌ Пользователь {uid} не найден."
+        await msg.answer(text, parse_mode="HTML")
+    except ValueError:
+        await msg.answer("❌ Введите числовой ID")
+
+@dp.callback_query(F.data == "admin:ban_user")
+async def ban_user_prompt(call: types.CallbackQuery, state: FSMContext):
+    if not await is_admin(call.from_user.id): return
+    await call.message.edit_text("🚫 Введите ID пользователя для бана:")
+    await state.set_state(AdminStates.ban_user)
+
+@dp.message(AdminStates.ban_user)
+async def do_ban(msg: types.Message, state: FSMContext):
+    await state.clear()
+    try:
+        uid = int(msg.text.strip())
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET is_banned=1 WHERE user_id=?", (uid,))
+            await db.commit()
+        await msg.answer(f"🚫 Пользователь {uid} заблокирован.")
+    except ValueError:
+        await msg.answer("❌ Введите числовой ID")
+
+@dp.callback_query(F.data == "admin:unban_user")
+async def unban_user_prompt(call: types.CallbackQuery, state: FSMContext):
+    if not await is_admin(call.from_user.id): return
+    await call.message.edit_text("✅ Введите ID пользователя для разбана:")
+    await state.set_state(AdminStates.unban_user)
+
+@dp.message(AdminStates.unban_user)
+async def do_unban(msg: types.Message, state: FSMContext):
+    await state.clear()
+    try:
+        uid = int(msg.text.strip())
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET is_banned=0 WHERE user_id=?", (uid,))
+            await db.commit()
+        await msg.answer(f"✅ Пользователь {uid} разблокирован.")
+    except ValueError:
+        await msg.answer("❌ Введите числовой ID")
+
+# Stats menu
+@dp.callback_query(F.data == "admin:stats_menu")
+async def stats_menu(call: types.CallbackQuery):
+    if not await is_admin(call.from_user.id):
+        await call.answer("❌ Нет доступа", show_alert=True); return
+    stats = await get_stats()
+
+    # Top seeds
+    top_seeds_text = ""
+    for i, (seed, cnt) in enumerate(stats["top_seeds"], 1):
+        top_seeds_text += f"  {i}. {seed}: {cnt} подписок\n"
+
+    # Daily new users (last 7 days)
+    daily_text = ""
+    for date, cnt in stats["daily_new"]:
+        bar = "█" * min(cnt, 20)
+        daily_text += f"  {date}: {bar} {cnt}\n"
+
+    # Hourly activity
+    hourly_text = ""
+    for hr, cnt in stats["hourly"]:
+        bar = "▪" * min(cnt // max(1, max(c for _, c in stats["hourly"]) // 10 + 1), 10)
+        hourly_text += f"  {hr}:00 {bar} {cnt}\n"
+
+    text = (
+        f"📊 <b>Статистика</b>\n\n"
+        f"🌱 <b>Топ-10 популярных seeds:</b>\n{top_seeds_text or '  —'}\n"
+        f"📅 <b>Новые пользователи (7 дней):</b>\n{daily_text or '  —'}\n"
+        f"⏱ <b>Активность по часам (уведомления):</b>\n{hourly_text or '  —'}"
     )
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="◀️ Назад", callback_data="admin:back")
+    ]])
+    try:
+        await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    except TelegramBadRequest:
+        await call.answer("Без изменений")
 
-# ── Background stock watcher ──────────────────────────────────────────────────
-async def stock_watcher():
-    prev_items: set[str] = set()
-    logger.info("Stock watcher started")
+@dp.callback_query(F.data == "admin:back")
+async def admin_back(call: types.CallbackQuery):
+    if not await is_admin(call.from_user.id): return
+    stats = await get_stats()
+    text = (
+        f"🛠 <b>Панель администратора</b>\n\n"
+        f"👥 Всего пользователей: <b>{stats['total']}</b>\n"
+        f"✅ Активных: <b>{stats['active']}</b>\n"
+        f"🚫 Забанено: <b>{stats['banned']}</b>\n"
+        f"🔔 Используют уведомления: <b>{stats['notif_users']}</b>\n"
+        f"📌 Всего подписок на seeds: <b>{stats['total_subs']}</b>\n"
+        f"🆕 Новых сегодня: <b>{stats['new_today']}</b>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin:broadcast_menu")],
+        [InlineKeyboardButton(text="👤 Пользователи", callback_data="admin:users_menu")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats_menu")],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin:refresh")]
+    ])
+    await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+
+# ── Stock notification worker ─────────────────────────────────────────────────
+_prev_in_stock = set()  # set of seed names that were in stock last check
+
+async def notification_worker():
+    global _prev_in_stock
+    await asyncio.sleep(5)  # wait for bot to start
+    log.info("Notification worker started")
     while True:
-        await asyncio.sleep(CHECK_INTERVAL)
         try:
             stock = await fetch_stock()
             if not stock:
+                await asyncio.sleep(POLL_INTERVAL)
                 continue
-            current_items = set(extract_all_items(stock))
-            new_items = current_items - prev_items
 
-            if new_items and prev_items:
-                data = load_data()
-                for uid, user_data in data.items():
-                    subs     = set(user_data.get("subscriptions", []))
-                    notified = user_data.get("notified", {})
-                    matched  = subs & new_items
-                    to_notify = [m for m in matched if not notified.get(m)]
-                    if to_notify:
-                        try:
-                            text = (
-                                "🔔 <b>Появились предметы в стоке!</b>\n\n"
-                                + "\n".join(f"✅ {item}" for item in sorted(to_notify))
-                                + "\n\n<i>Открой бота, чтобы посмотреть подробности.</i>"
-                            )
-                            await bot.send_message(int(uid), text, parse_mode="HTML", reply_markup=main_menu())
-                            for item in to_notify:
-                                notified[item] = True
-                        except Exception as e:
-                            logger.warning(f"Could not notify {uid}: {e}")
+            seeds = extract_seeds(stock)
+            now_in_stock = {s for s in seeds if is_in_stock(stock, s)}
 
-                # Сбрасываем флаг уведомления для предметов которых уже нет
-                for uid, user_data in data.items():
-                    notified = user_data.get("notified", {})
-                    for item in list(notified.keys()):
-                        if item not in current_items:
-                            del notified[item]
-                save_data(data)
+            # seeds that just appeared in stock
+            newly_available = now_in_stock - _prev_in_stock
 
-            prev_items = current_items
+            if newly_available:
+                log.info(f"New in stock: {newly_available}")
+                async with aiosqlite.connect(DB_PATH) as db:
+                    for seed in newly_available:
+                        # find all users subscribed to this seed
+                        async with db.execute(
+                            "SELECT u.user_id FROM subscriptions s JOIN users u ON s.user_id=u.user_id "
+                            "WHERE s.seed_name=? AND u.is_banned=0",
+                            (seed,)
+                        ) as cur:
+                            subscribers = [r[0] for r in await cur.fetchall()]
+
+                        for uid in subscribers:
+                            try:
+                                await bot.send_message(
+                                    uid,
+                                    f"🚨 <b>{seed}</b> появился в стоке!\n\n"
+                                    f"🌱 Спеши купить, пока не закончился!\n"
+                                    f"📦 /stock — смотреть весь сток",
+                                    parse_mode="HTML"
+                                )
+                                await db.execute(
+                                    "INSERT INTO notification_log (user_id, seed_name, sent_at) VALUES (?,?,?)",
+                                    (uid, seed, datetime.now().isoformat())
+                                )
+                                await asyncio.sleep(0.05)
+                            except Exception as e:
+                                log.warning(f"Failed to notify {uid}: {e}")
+                    await db.commit()
+
+            _prev_in_stock = now_in_stock
         except Exception as e:
-            logger.error(f"Watcher error: {e}")
+            log.error(f"Worker error: {e}")
+        await asyncio.sleep(POLL_INTERVAL)
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+@dp.message(Command("stock"))
+async def stock_cmd(msg: types.Message):
+    await upsert_user(msg.from_user)
+    if await is_banned(msg.from_user.id): return
+    if not await require_sub(msg): return
+    wait = await msg.answer("⏳ Загружаю сток...")
+    stock = await fetch_stock()
+    text = format_stock_message(stock)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🔄 Обновить", callback_data="refresh_stock")
+    ]])
+    try:
+        await wait.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    except TelegramBadRequest:
+        await wait.delete()
+        await msg.answer(text, parse_mode="HTML", reply_markup=kb)
+
+# ── Main ─────────────────────────────────────────────────────────────────────
 async def main():
-    asyncio.create_task(stock_watcher())
-    logger.info("Bot started. Make sure the bot is an ADMIN in the channel!")
-    await dp.start_polling(bot)
+    await init_db()
+    asyncio.create_task(notification_worker())
+    log.info("Bot started")
+    await dp.start_polling(bot, skip_updates=True)
 
 if __name__ == "__main__":
     asyncio.run(main())
